@@ -45,19 +45,6 @@ usermod -aG sudo "${USERNAME}" || { echo "Failed to add user to sudo group"; exi
 echo "${USERNAME}:${PASSWORD}" | chpasswd || { echo "Failed to set user password"; exit 1; }
 echo "User ${USERNAME} created successfully"
     
-# Add SSH key if provided
-if [ ! -z "${PUBKEY}" ]; then
-    echo "Adding SSH public key for user ${USERNAME}"
-    mkdir -p /home/${USERNAME}/.ssh
-    echo "${PUBKEY}" > /home/${USERNAME}/.ssh/authorized_keys
-    chmod 700 /home/${USERNAME}/.ssh
-    chmod 600 /home/${USERNAME}/.ssh/authorized_keys
-    chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.ssh
-    echo "SSH key added successfully"
-else
-    echo "No SSH public key provided, skipping"
-fi
-
 # 5. Install nginx, mariadb, php8
 echo "Installing nginx, MariaDB, and PHP..."
 apt-get install -y nginx mariadb-server
