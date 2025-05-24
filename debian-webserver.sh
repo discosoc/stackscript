@@ -370,7 +370,9 @@ EOL
 fi
 
 # Restart nginx to apply changes
+echo "Restarting nginx to apply all configuration changes..."
 systemctl restart nginx
+sleep 5  # Give nginx time to fully restart and apply configurations
 
 # 13. Obtain SSL certificate with certbot for primary domain
 echo "Setting up SSL with certbot for ${PRIMARY_DOMAIN}..."
@@ -379,7 +381,27 @@ certbot --nginx -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} --non-interactive 
 # Obtain SSL certificate for secondary domain if provided
 if [ ! -z "${SECONDARY_DOMAIN}" ]; then
     echo "Setting up SSL with certbot for ${SECONDARY_DOMAIN}..."
-    certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL}
+    
+    # Give a bit more time before attempting second certificate
+    sleep 10
+    
+    # Ensure nginx configuration is working properly for the secondary domain
+    echo "Testing nginx configuration for ${SECONDARY_DOMAIN}..."
+    nginx -t
+    
+    # Reload nginx again to ensure all configs are applied
+    systemctl reload nginx
+    
+    # Attempt to get certificate with expanded error output
+    certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} \
+        --non-interactive --agree-tos --email ${ADMIN_EMAIL} \
+        --preferred-challenges http-01 \
+        --verbose || {
+            echo "WARNING: Failed to obtain SSL certificate for ${SECONDARY_DOMAIN}"
+            echo "You can try manually after DNS propagation with:"
+            echo "certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} --preferred-challenges http-01"
+            echo "Continuing with setup..."
+        }
 fi
 
 # Final system restart
@@ -397,9 +419,15 @@ echo "======================================"
 echo "Setup complete! Your server is now configured with nginx, MariaDB, PHP 8.2, and SSL."
 echo "======================================"
 echo "Created user: ${USERNAME}"
-echo "Primary domain: ${PRIMARY_DOMAIN}"
+echo "Primary domain: https://${PRIMARY_DOMAIN}"
 if [ ! -z "${SECONDARY_DOMAIN}" ]; then
-    echo "Secondary domain: ${SECONDARY_DOMAIN}"
+    if certbot certificates | grep -q "${SECONDARY_DOMAIN}"; then
+        echo "Secondary domain: https://${SECONDARY_DOMAIN}"
+    else
+        echo "Secondary domain: http://${SECONDARY_DOMAIN} (SSL certificate not issued)"
+        echo "To manually obtain a certificate later, run:"
+        echo "  sudo certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN}"
+    fi
 fi
 echo "SSL certificates will auto-renew"
 echo "Web root directories:"
