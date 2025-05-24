@@ -1,8 +1,3 @@
-#!/bin/bash
-# <UDF name="USERNAME" label="The limited sudo user to be created" example="myuser" default="">
-# <UDF name="PASSWORD" label="The password for the limited sudo user" example="s3cure_p4ssw0rd" default="">
-# <UDF name="PUBKEY" label="The SSH Public Key that will be used to access the server (optional)" default="">
-
 # This makes the script verbose, showing all executed commands
 set -x
 
