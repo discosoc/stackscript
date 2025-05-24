@@ -5,7 +5,11 @@ set -x
 exec > >(tee -a /root/stackscript.log) 2>&1
 
 echo "Stack Script starting at $(date)"
-echo "UDF Variables received: USERNAME=${USERNAME}"
+echo "UDF Variables received:"
+echo "USERNAME=${USERNAME}"
+echo "PRIMARY_DOMAIN=${PRIMARY_DOMAIN}"
+echo "SECONDARY_DOMAIN=${SECONDARY_DOMAIN}"
+echo "ADMIN_EMAIL=${ADMIN_EMAIL}"
 
 # Exit script if any command fails
 set -e
@@ -15,14 +19,15 @@ echo "Starting system update..."
 apt-get update
 apt-get upgrade -y
 
-# 1. Set up hostname to 'aktechworks'
-echo "Setting hostname to 'aktechworks'..."
-echo "aktechworks" > /etc/hostname
+# 1. Set up hostname (use the primary domain name without the TLD)
+HOSTNAME=$(echo "${PRIMARY_DOMAIN}" | cut -d. -f1)
+echo "Setting hostname to '${HOSTNAME}'..."
+echo "${HOSTNAME}" > /etc/hostname
 hostname -F /etc/hostname
 
-# 2. Set up FQDN to 'aktechworks.net'
+# 2. Set up FQDN to the primary domain
 echo "Setting up FQDN..."
-echo "127.0.1.1 aktechworks.net aktechworks" >> /etc/hosts
+echo "127.0.1.1 ${PRIMARY_DOMAIN} ${HOSTNAME}" >> /etc/hosts
 
 # 3. Set timezone to 'America/Anchorage'
 echo "Setting timezone..."
@@ -45,6 +50,19 @@ usermod -aG sudo "${USERNAME}" || { echo "Failed to add user to sudo group"; exi
 echo "${USERNAME}:${PASSWORD}" | chpasswd || { echo "Failed to set user password"; exit 1; }
 echo "User ${USERNAME} created successfully"
     
+# Add SSH key if provided
+if [ ! -z "${PUBKEY}" ]; then
+    echo "Adding SSH public key for user ${USERNAME}"
+    mkdir -p /home/${USERNAME}/.ssh
+    echo "${PUBKEY}" > /home/${USERNAME}/.ssh/authorized_keys
+    chmod 700 /home/${USERNAME}/.ssh
+    chmod 600 /home/${USERNAME}/.ssh/authorized_keys
+    chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.ssh
+    echo "SSH key added successfully"
+else
+    echo "No SSH public key provided, skipping"
+fi
+
 # 5. Install nginx, mariadb, php8
 echo "Installing nginx, MariaDB, and PHP..."
 apt-get install -y nginx mariadb-server
@@ -173,7 +191,7 @@ EOL
 
 # Create SFTP group and add user to it
 echo "Setting up SFTP group..."
-groupadd sftp
+groupadd sftp 2>/dev/null || true
 usermod -a -G sftp ${USERNAME}
 
 # Restart SSH service
@@ -183,34 +201,88 @@ systemctl restart ssh
 echo "Installing certbot..."
 apt-get install -y certbot python3-certbot-nginx
 
-# 10. Setup root web directory
+# 10. Setup web directory structure for primary domain
 echo "Creating web directories..."
-mkdir -p /srv/www/aktechworks.net
-chown -R www-data:www-data /srv/www
-chmod -R 755 /srv/www
+mkdir -p /srv/www/${PRIMARY_DOMAIN}
+
+# Create a web group for shared permissions between user and www-data
+groupadd webgroup 2>/dev/null || true
+usermod -a -G webgroup ${USERNAME}
+usermod -a -G webgroup www-data
 
 # Set proper permissions for SFTP
 chown root:root /srv/www
 chmod 755 /srv/www
-chown -R ${USERNAME}:${USERNAME} /srv/www/aktechworks.net
+mkdir -p /srv/www/${PRIMARY_DOMAIN}
+chown -R ${USERNAME}:webgroup /srv/www/${PRIMARY_DOMAIN}
+chmod -R 775 /srv/www/${PRIMARY_DOMAIN}
+chmod g+s /srv/www/${PRIMARY_DOMAIN}
 
-# 11 & 12. Configure nginx virtual host with PHP support
-echo "Configuring nginx virtual host..."
-cat > /etc/nginx/sites-available/aktechworks.net << 'EOL'
+# Create a simple index.php for the primary domain
+echo "Creating index.php for ${PRIMARY_DOMAIN}..."
+cat > /srv/www/${PRIMARY_DOMAIN}/index.php << EOL
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${PRIMARY_DOMAIN}</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f5f5f5;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            max-width: 600px;
+        }
+        h1 {
+            color: #333;
+        }
+        p {
+            color: #666;
+            margin: 1rem 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to <?php echo htmlspecialchars('${PRIMARY_DOMAIN}'); ?></h1>
+        <p>Your website is successfully configured and running with nginx and PHP <?php echo phpversion(); ?>.</p>
+        <p>Server Time: <?php echo date('Y-m-d H:i:s'); ?></p>
+        <p>Site document root: <?php echo htmlspecialchars($_SERVER['DOCUMENT_ROOT']); ?></p>
+    </div>
+</body>
+</html>
+EOL
+
+# 11 & 12. Configure nginx virtual host with PHP support for primary domain
+echo "Configuring nginx virtual host for ${PRIMARY_DOMAIN}..."
+cat > /etc/nginx/sites-available/${PRIMARY_DOMAIN} << EOL
 server {
     listen 80;
-    server_name aktechworks.net www.aktechworks.net;
-    root /srv/www/aktechworks.net;
+    server_name ${PRIMARY_DOMAIN} www.${PRIMARY_DOMAIN};
+    root /srv/www/${PRIMARY_DOMAIN};
     index index.php index.html index.htm;
 
     location / {
-        try_files $uri $uri/ /index.php?$args;
+        try_files \$uri \$uri/ /index.php?\$args;
     }
 
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
     }
 
@@ -221,24 +293,107 @@ server {
 EOL
 
 # Enable the site
-ln -s /etc/nginx/sites-available/aktechworks.net /etc/nginx/sites-enabled/
+ln -s /etc/nginx/sites-available/${PRIMARY_DOMAIN} /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 
-# Create a sample index.php file
-echo "Creating sample index.php..."
-cat > /srv/www/aktechworks.net/index.php << 'EOL'
-<?php
-phpinfo();
+# Setup secondary domain if provided
+if [ ! -z "${SECONDARY_DOMAIN}" ]; then
+    echo "Setting up secondary domain: ${SECONDARY_DOMAIN}"
+    
+    # Create directory structure
+    mkdir -p /srv/www/${SECONDARY_DOMAIN}
+    chown -R ${USERNAME}:webgroup /srv/www/${SECONDARY_DOMAIN}
+    chmod -R 775 /srv/www/${SECONDARY_DOMAIN}
+    chmod g+s /srv/www/${SECONDARY_DOMAIN}
+    
+    # Create a simple index.php for the secondary domain
+    cat > /srv/www/${SECONDARY_DOMAIN}/index.php << EOL
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${SECONDARY_DOMAIN}</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f5f5f5;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            max-width: 600px;
+        }
+        h1 {
+            color: #333;
+        }
+        p {
+            color: #666;
+            margin: 1rem 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to <?php echo htmlspecialchars('${SECONDARY_DOMAIN}'); ?></h1>
+        <p>Your website is successfully configured and running with nginx and PHP <?php echo phpversion(); ?>.</p>
+        <p>Server Time: <?php echo date('Y-m-d H:i:s'); ?></p>
+        <p>Site document root: <?php echo htmlspecialchars($_SERVER['DOCUMENT_ROOT']); ?></p>
+    </div>
+</body>
+</html>
 EOL
 
-# Set proper ownership
-chown -R www-data:www-data /srv/www/aktechworks.net
-chmod -R 755 /srv/www/aktechworks.net
+    # Create nginx configuration
+    cat > /etc/nginx/sites-available/${SECONDARY_DOMAIN} << EOL
+server {
+    listen 80;
+    server_name ${SECONDARY_DOMAIN} www.${SECONDARY_DOMAIN};
+    root /srv/www/${SECONDARY_DOMAIN};
+    index index.php index.html index.htm;
 
-# 13. Obtain SSL certificate with certbot
-echo "Setting up SSL with certbot..."
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOL
+
+    # Enable the site
+    ln -s /etc/nginx/sites-available/${SECONDARY_DOMAIN} /etc/nginx/sites-enabled/
+fi
+
+# Restart nginx to apply changes
 systemctl restart nginx
-certbot --nginx -d aktechworks.net -d www.aktechworks.net --non-interactive --agree-tos --email admin@aktechworks.net
+
+# 13. Obtain SSL certificate with certbot for primary domain
+echo "Setting up SSL with certbot for ${PRIMARY_DOMAIN}..."
+certbot --nginx -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL}
+
+# Obtain SSL certificate for secondary domain if provided
+if [ ! -z "${SECONDARY_DOMAIN}" ]; then
+    echo "Setting up SSL with certbot for ${SECONDARY_DOMAIN}..."
+    certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL}
+fi
 
 # Final system restart
 echo "Restarting services..."
@@ -246,10 +401,23 @@ systemctl restart nginx
 systemctl restart php8.2-fpm
 systemctl restart mariadb
 
+# Add a cron job to auto-renew SSL certificates
+echo "Setting up automatic SSL renewal..."
+echo "0 3 * * * /usr/bin/certbot renew --quiet" > /etc/cron.d/certbot-renew
+chmod 644 /etc/cron.d/certbot-renew
+
 echo "======================================"
 echo "Setup complete! Your server is now configured with nginx, MariaDB, PHP 8.2, and SSL."
 echo "======================================"
 echo "Created user: ${USERNAME}"
-echo "Website URL: https://aktechworks.net"
-echo "Web root directory: /srv/www/aktechworks.net"
+echo "Primary domain: ${PRIMARY_DOMAIN}"
+if [ ! -z "${SECONDARY_DOMAIN}" ]; then
+    echo "Secondary domain: ${SECONDARY_DOMAIN}"
+fi
+echo "SSL certificates will auto-renew"
+echo "Web root directories:"
+echo "  /srv/www/${PRIMARY_DOMAIN}"
+if [ ! -z "${SECONDARY_DOMAIN}" ]; then
+    echo "  /srv/www/${SECONDARY_DOMAIN}"
+fi
 echo "Stack Script log: /root/stackscript.log"
