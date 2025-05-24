@@ -376,7 +376,9 @@ sleep 5  # Give nginx time to fully restart and apply configurations
 
 # 13. Obtain SSL certificate with certbot for primary domain
 echo "Setting up SSL with certbot for ${PRIMARY_DOMAIN}..."
-certbot --nginx -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL}
+certbot --nginx -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} \
+    --non-interactive --agree-tos --email ${ADMIN_EMAIL} \
+    --cert-name ${PRIMARY_DOMAIN}
 
 # Obtain SSL certificate for secondary domain if provided
 if [ ! -z "${SECONDARY_DOMAIN}" ]; then
@@ -392,14 +394,15 @@ if [ ! -z "${SECONDARY_DOMAIN}" ]; then
     # Reload nginx again to ensure all configs are applied
     systemctl reload nginx
     
-    # Attempt to get certificate with expanded error output
+    # Attempt to get certificate with expanded error output - force separate certificate
     certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} \
         --non-interactive --agree-tos --email ${ADMIN_EMAIL} \
+        --cert-name ${SECONDARY_DOMAIN} \
         --preferred-challenges http-01 \
         --verbose || {
             echo "WARNING: Failed to obtain SSL certificate for ${SECONDARY_DOMAIN}"
             echo "You can try manually after DNS propagation with:"
-            echo "certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} --preferred-challenges http-01"
+            echo "certbot --nginx -d ${SECONDARY_DOMAIN} -d www.${SECONDARY_DOMAIN} --cert-name ${SECONDARY_DOMAIN}"
             echo "Continuing with setup..."
         }
 fi
