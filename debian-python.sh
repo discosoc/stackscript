@@ -279,7 +279,7 @@ User=${USERNAME}
 Group=${USERNAME}
 WorkingDirectory=/srv/www/aktechworks.net
 Environment="PATH=/srv/www/aktechworks.net/venv/bin"
-ExecStart=/srv/www/aktechworks.net/venv/bin/gunicorn --workers 3 --bind unix:aktechworks.sock -m 007 app:app
+ExecStart=/srv/www/aktechworks.net/venv/bin/gunicorn --workers 3 --bind unix:/srv/www/aktechworks.net/aktechworks.sock -m 007 app:app
 
 [Install]
 WantedBy=multi-user.target
@@ -288,6 +288,9 @@ EOL
 # Enable and start Gunicorn
 systemctl enable gunicorn
 systemctl start gunicorn
+
+# Add www-data to user group for socket access
+usermod -a -G ${USERNAME} www-data
 
 # 14. Configure nginx as reverse proxy
 echo "Configuring nginx as reverse proxy..."
