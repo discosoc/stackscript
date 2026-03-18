@@ -414,7 +414,9 @@ issue_and_install_cert() {
     echo "Requesting staging cert for ${DOMAIN}..."
 
     set +e
-    ${ACME} --issue --staging \
+    # Toggle between staging and production by swapping which line is commented out.
+    # ${ACME} --issue --staging \    # staging  — high rate limits, untrusted cert, use for test deployments
+    ${ACME} --issue \                # production — trusted cert, rate limited to 5/domain/week
         -d "${DOMAIN}" -d "www.${DOMAIN}" \
         --dns dns_namecheap
     local RESULT=$?
