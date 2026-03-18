@@ -7,8 +7,9 @@
 # <UDF name="PASSWORD"       label="Admin password" />
 # <UDF name="ADMIN_EMAIL"    label="Admin email address (used by acme.sh)"                                      example="admin@example.com" />
 # <UDF name="PRIMARY_DOMAIN" label="Primary domain"                                                             example="portal.example.com" />
-# <UDF name="OFFICE_IP"      label="MSP office IPs — comma-separated IPs, CIDRs, or FQDNs (ports 22/80/443)"  example="203.0.113.10,203.0.113.11,host.example.com" />
-# <UDF name="CF_TOKEN"       label="Cloudflare API Token (DNS-01 cert validation via acme.sh)" />
+# <UDF name="OFFICE_IP"          label="MSP office IPs — comma-separated IPs, CIDRs, or FQDNs (ports 22/80/443)"  example="203.0.113.10,203.0.113.11,host.example.com" />
+# <UDF name="NAMECHEAP_USERNAME" label="Namecheap account username (for DNS-01 cert validation via acme.sh)" />
+# <UDF name="NAMECHEAP_API_KEY"  label="Namecheap API key (Profile > Tools > Namecheap API)" />
 
 # ============================================================
 # Init — verbose logging
@@ -387,7 +388,12 @@ ACME="/root/.acme.sh/acme.sh"
 #   (acme.sh will automatically reload nginx via the installed --reloadcmd)
 
 echo "[11/13] Issuing SSL certificates (staging mode)..."
-export CF_Token="${CF_TOKEN}"
+
+# NAMECHEAP_SOURCEIP must match the IP whitelisted in your Namecheap API settings.
+# For a static Linode this is the server's own public IP, detected from the interface.
+export NAMECHEAP_USERNAME="${NAMECHEAP_USERNAME}"
+export NAMECHEAP_API_KEY="${NAMECHEAP_API_KEY}"
+export NAMECHEAP_SOURCEIP=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K[\d.]+')
 
 issue_and_install_cert() {
     local DOMAIN="$1"
@@ -396,7 +402,7 @@ issue_and_install_cert() {
     set +e
     ${ACME} --issue --staging \
         -d "${DOMAIN}" -d "www.${DOMAIN}" \
-        --dns dns_cf \
+        --dns dns_namecheap \
         --server letsencrypt
     local RESULT=$?
     set -e
@@ -533,10 +539,12 @@ echo "Domain      : ${PRIMARY_DOMAIN}  [$(cert_status ${PRIMARY_DOMAIN})]"
 echo ""
 echo "SSL note    : Certificates are in STAGING mode (not browser-trusted)."
 echo "              To issue production certs after testing:"
-echo "                export CF_Token=<token>"
+echo "                export NAMECHEAP_USERNAME=<username>"
+echo "                export NAMECHEAP_API_KEY=<key>"
+echo "                export NAMECHEAP_SOURCEIP=<this_server_ip>"
 echo "                /root/.acme.sh/acme.sh --issue --force \\"
 echo "                  -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} \\"
-echo "                  --dns dns_cf --server letsencrypt"
+echo "                  --dns dns_namecheap --server letsencrypt"
 echo ""
 echo "Web roots   : /srv/www/<domain>/public/"
 echo "Config file : /etc/msp-portal/config.json (populate before first run)"
