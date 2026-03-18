@@ -9,7 +9,7 @@
 # <UDF name="PRIMARY_DOMAIN" label="Primary domain"                                                             example="portal.example.com" />
 # <UDF name="OFFICE_IP"          label="MSP office IPs — comma-separated IPs, CIDRs, or FQDNs (ports 22/80/443)"  example="203.0.113.10,203.0.113.11,host.example.com" />
 # <UDF name="NAMECHEAP_USERNAME" label="Namecheap account username (for DNS-01 cert validation via acme.sh)" />
-# <UDF name="NAMECHEAP_API_KEY"  label="Namecheap API key (Profile > Tools > Namecheap API)" />
+# <UDF name="NAMECHEAP_API_KEY"  label="Namecheap API key (find under Profile, Tools, Namecheap API)" />
 
 # ============================================================
 # Init — verbose logging
