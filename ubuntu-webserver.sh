@@ -86,6 +86,7 @@ echo "Installed PHP version: ${PHP_VERSION}"
 
 # Install Composer globally
 echo "Installing Composer..."
+export COMPOSER_ALLOW_SUPERUSER=1
 curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 echo "Composer: $(composer --version)"
 
