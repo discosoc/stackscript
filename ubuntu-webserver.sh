@@ -62,6 +62,20 @@ usermod -aG sudo "${USERNAME}"
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 echo "User ${USERNAME} created successfully"
 
+# Copy Linode-injected SSH keys from root to the admin user.
+# Linode writes keys from your profile into /root/.ssh/authorized_keys at boot.
+# Since root login is disabled, they must be copied to the admin user's home.
+if [ -f /root/.ssh/authorized_keys ]; then
+    mkdir -p /home/${USERNAME}/.ssh
+    cp /root/.ssh/authorized_keys /home/${USERNAME}/.ssh/authorized_keys
+    chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.ssh
+    chmod 700 /home/${USERNAME}/.ssh
+    chmod 600 /home/${USERNAME}/.ssh/authorized_keys
+    echo "SSH keys copied to ${USERNAME}"
+else
+    echo "WARNING: No /root/.ssh/authorized_keys found — SSH key login will not work until keys are added manually"
+fi
+
 # ============================================================
 # 5. Install nginx, PHP, and Composer
 # ============================================================
@@ -288,9 +302,8 @@ Match Group sftp
     X11Forwarding no
 EOL
 
-# Create sftp group and add the admin user to it
+# Create sftp group — for dedicated cert-distribution accounts only, not the admin user
 groupadd sftp 2>/dev/null || true
-usermod -a -G sftp "${USERNAME}"
 
 systemctl restart ssh
 
