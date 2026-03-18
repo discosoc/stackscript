@@ -403,8 +403,7 @@ issue_and_install_cert() {
     set +e
     ${ACME} --issue --staging \
         -d "${DOMAIN}" -d "www.${DOMAIN}" \
-        --dns dns_namecheap \
-        --server letsencrypt
+        --dns dns_namecheap
     local RESULT=$?
     set -e
 
