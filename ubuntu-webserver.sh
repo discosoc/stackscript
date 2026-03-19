@@ -351,15 +351,15 @@ setup_domain_dir "${PRIMARY_DOMAIN}"
 # ============================================================
 echo "Setting up credentials directory..."
 
-# /etc/msp-portal/ holds the JSON config file referenced in msp-portal-framework.md §6.3.
+# /etc/aktechworks-net/ holds the JSON config file referenced in msp-portal-framework.md §6.3.
 # It lives outside the web root and is only accessible to the admin user (rw)
 # and www-data / PHP-FPM (r). No other users or processes have access.
-mkdir -p /etc/msp-portal
-chown "${USERNAME}:www-data" /etc/msp-portal
-chmod 750 /etc/msp-portal
+mkdir -p /etc/aktechworks-net
+chown "${USERNAME}:www-data" /etc/aktechworks-net
+chmod 750 /etc/aktechworks-net
 
 # Placeholder config — populate manually before first application run
-cat > /etc/msp-portal/config.json << 'EOL'
+cat > /etc/aktechworks-net/config.json << 'EOL'
 {
     "_note": "Populate before first run — see msp-portal-framework.md §6.3",
     "key_vault": {
@@ -372,8 +372,8 @@ cat > /etc/msp-portal/config.json << 'EOL'
     }
 }
 EOL
-chown "${USERNAME}:www-data" /etc/msp-portal/config.json
-chmod 640 /etc/msp-portal/config.json
+chown "${USERNAME}:www-data" /etc/aktechworks-net/config.json
+chmod 640 /etc/aktechworks-net/config.json
 
 # ============================================================
 # 10. Install acme.sh
@@ -562,7 +562,7 @@ echo "                  -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} \\"
 echo "                  --dns dns_namecheap --server letsencrypt"
 echo ""
 echo "Web roots   : /srv/www/<domain>/public/"
-echo "Config file : /etc/msp-portal/config.json (populate before first run)"
+echo "Config file : /etc/aktechworks-net/config.json (populate before first run)"
 echo "Nginx logs  : /var/log/nginx/"
 echo "Script log  : /root/stackscript.log"
 echo "======================================================"
