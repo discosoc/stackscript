@@ -376,6 +376,31 @@ chown "${USERNAME}:www-data" /etc/aktechworks-net/config.json
 chmod 640 /etc/aktechworks-net/config.json
 
 # ============================================================
+# 9c. Git deployment repo
+# ============================================================
+echo "Setting up git deployment repo..."
+
+# Bare repo — push to this from your local machine to deploy.
+# The post-receive hook checks out files to the web root,
+# runs composer install, and reloads PHP-FPM.
+mkdir -p /srv/git/aktechworks-net.git
+git init --bare /srv/git/aktechworks-net.git
+chown -R "${USERNAME}:${USERNAME}" /srv/git/aktechworks-net.git
+
+# post-receive hook — PHP_VERSION and PRIMARY_DOMAIN are baked in at provisioning time
+cat > /srv/git/aktechworks-net.git/hooks/post-receive << HOOK
+#!/bin/bash
+GIT_WORK_TREE=/srv/www/${PRIMARY_DOMAIN} git checkout -f main
+cd /srv/www/${PRIMARY_DOMAIN}
+composer install --no-dev --optimize-autoloader
+systemctl reload php${PHP_VERSION}-fpm
+HOOK
+
+chmod +x /srv/git/aktechworks-net.git/hooks/post-receive
+echo "Git repo: /srv/git/aktechworks-net.git"
+echo "To add remote locally: git remote add linode ${USERNAME}@${PRIMARY_DOMAIN}:/srv/git/aktechworks-net.git"
+
+# ============================================================
 # 10. Install acme.sh
 # ============================================================
 echo "[10/13] Installing acme.sh..."
