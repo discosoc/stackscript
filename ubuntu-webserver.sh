@@ -440,8 +440,10 @@ issue_and_install_cert() {
 
     set +e
     # Toggle between staging and production by swapping which line is commented out.
-    ${ACME} --issue --staging \    # staging  — high rate limits, untrusted cert, use for test deployments
-    # ${ACME} --issue \                # production — trusted cert, rate limited to 5/domain/week
+    # Staging:    high rate limits, untrusted cert — use for test deployments
+    # Production: trusted cert, rate limited to 5/domain/week
+    # ${ACME} --issue --staging \
+    ${ACME} --issue --staging \
         -d "${DOMAIN}" -d "www.${DOMAIN}" \
         --dns dns_namecheap
     local RESULT=$?
