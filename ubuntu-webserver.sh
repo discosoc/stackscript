@@ -92,7 +92,7 @@ apt-get install -y curl unzip git
 #   ldap     — Active Directory / LDAPS connections (php ldap_* extension)
 #   sqlite3  — SQLite app data store via PDO
 #   zip      — Composer package extraction
-apt-get install -y nginx php php-cli php-fpm php-mbstring php-xml php-curl php-ldap php-sqlite3 php-zip
+apt-get install -y nginx php php-cli php-fpm php-mbstring php-xml php-curl php-ldap php-sqlite3 php-zip sqlite3
 
 # Detect the installed PHP version — needed for the FPM socket path and service name
 PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
@@ -176,19 +176,24 @@ done
 ufw --force enable
 ufw status verbose
 
-# If any FQDNs were registered, install the dynamic refresh script and cron job
-if [ "${DDNS_FOUND}" = "true" ]; then
-    echo "DDNS entries detected — installing refresh script..."
+# Install UFW dynamic refresh script — always installed.
+# Handles both DDNS hostname tracking and client IP sync from SQLite.
+echo "Installing UFW dynamic refresh script..."
 
-    cat > /usr/local/sbin/ufw-dynamic-refresh << 'SCRIPT'
+cat > /usr/local/sbin/ufw-dynamic-refresh << 'SCRIPT'
 #!/bin/bash
-# Refreshes UFW rules for DDNS hostnames tracked in /etc/ufw-dynamic/.
-# When a hostname resolves to a new IP, the stale rules are removed and
-# new rules are added. Resolution failures leave existing rules intact.
+# Refreshes UFW rules for:
+# 1. DDNS hostnames tracked in /etc/ufw-dynamic/*.ip files
+# 2. Client IPs from the aktechworks SQLite database
+
 DDNS_DIR="/etc/ufw-dynamic"
 LOG="/var/log/ufw-dynamic.log"
-PORTS=(22 80 443)
+DDNS_PORTS=(22 80 443)
+CLIENT_PORTS=(80 443)
+DB="/etc/aktechworks-net/app.db"
+CLIENT_TRACK="${DDNS_DIR}/client-ips.txt"
 
+# --- DDNS refresh ---
 for TRACK_FILE in "${DDNS_DIR}"/*.ip; do
     [ -f "${TRACK_FILE}" ] || continue
     HOSTNAME=$(basename "${TRACK_FILE}" .ip)
@@ -205,29 +210,62 @@ for TRACK_FILE in "${DDNS_DIR}"/*.ip; do
         continue
     fi
 
-    echo "$(date -Iseconds) ${HOSTNAME}: ${OLD_IP} -> ${NEW_IP}" >> "${LOG}"
+    echo "$(date -Iseconds) DDNS ${HOSTNAME}: ${OLD_IP} -> ${NEW_IP}" >> "${LOG}"
 
-    for PORT in "${PORTS[@]}"; do
+    for PORT in "${DDNS_PORTS[@]}"; do
         ufw delete allow from "${OLD_IP}" to any port "${PORT}" proto tcp 2>/dev/null || true
     done
 
-    for PORT in "${PORTS[@]}"; do
+    for PORT in "${DDNS_PORTS[@]}"; do
         ufw allow from "${NEW_IP}" to any port "${PORT}" proto tcp comment "DDNS:${HOSTNAME}"
     done
 
     echo "${NEW_IP}" > "${TRACK_FILE}"
 done
+
+# --- Client IP sync from SQLite ---
+if [ -f "${DB}" ] && command -v sqlite3 &>/dev/null; then
+    CURRENT_IPS=$(sqlite3 "${DB}" "SELECT DISTINCT ip_address FROM client_ips JOIN clients ON clients.id = client_ips.client_id WHERE clients.active = 1" 2>/dev/null)
+    TRACKED_IPS=""
+    [ -f "${CLIENT_TRACK}" ] && TRACKED_IPS=$(cat "${CLIENT_TRACK}")
+
+    # Remove rules for IPs no longer in DB
+    while IFS= read -r IP; do
+        [ -z "${IP}" ] && continue
+        if ! echo "${CURRENT_IPS}" | grep -qx "${IP}"; then
+            echo "$(date -Iseconds) CLIENT: removing ${IP}" >> "${LOG}"
+            for PORT in "${CLIENT_PORTS[@]}"; do
+                ufw delete allow from "${IP}" to any port "${PORT}" proto tcp 2>/dev/null || true
+            done
+        fi
+    done <<< "${TRACKED_IPS}"
+
+    # Add rules for new IPs
+    while IFS= read -r IP; do
+        [ -z "${IP}" ] && continue
+        if ! echo "${TRACKED_IPS}" | grep -qx "${IP}"; then
+            echo "$(date -Iseconds) CLIENT: adding ${IP}" >> "${LOG}"
+            for PORT in "${CLIENT_PORTS[@]}"; do
+                ufw allow from "${IP}" to any port "${PORT}" proto tcp comment "CLIENT:${IP}"
+            done
+        fi
+    done <<< "${CURRENT_IPS}"
+
+    echo "${CURRENT_IPS}" > "${CLIENT_TRACK}"
+fi
 SCRIPT
 
-    chmod 700 /usr/local/sbin/ufw-dynamic-refresh
+chmod 700 /usr/local/sbin/ufw-dynamic-refresh
 
-    cat > /etc/cron.d/ufw-dynamic << 'EOL'
+cat > /etc/cron.d/ufw-dynamic << 'EOL'
 */10 * * * * root /usr/local/sbin/ufw-dynamic-refresh
 EOL
-    chmod 644 /etc/cron.d/ufw-dynamic
+chmod 644 /etc/cron.d/ufw-dynamic
 
-    echo "Refresh script: /usr/local/sbin/ufw-dynamic-refresh"
-    echo "Cron: every 10 minutes — log at /var/log/ufw-dynamic.log"
+echo "UFW refresh script: /usr/local/sbin/ufw-dynamic-refresh"
+echo "Cron: every 10 minutes — log at /var/log/ufw-dynamic.log"
+if [ "${DDNS_FOUND}" = "true" ]; then
+    echo "DDNS tracking active for registered hostnames."
 fi
 
 # ============================================================
@@ -356,7 +394,7 @@ echo "Setting up credentials directory..."
 # and www-data / PHP-FPM (r). No other users or processes have access.
 mkdir -p /etc/aktechworks-net
 chown "${USERNAME}:www-data" /etc/aktechworks-net
-chmod 750 /etc/aktechworks-net
+chmod 770 /etc/aktechworks-net
 
 # Placeholder config — populate manually before first application run
 cat > /etc/aktechworks-net/config.json << 'EOL'
@@ -365,15 +403,34 @@ cat > /etc/aktechworks-net/config.json << 'EOL'
     "key_vault": {
         "tenant_id": "",
         "client_id": "",
-        "client_secret": ""
+        "client_secret": "",
+        "vault_url": "https://{vault-name}.vault.azure.net"
     },
     "oauth": {
-        "allowed_domains": []
+        "client_id": "",
+        "client_secret": "",
+        "redirect_uri": "https://aktechworks.net/auth/callback",
+        "allowed_domains": ["aktechworks.com"]
     }
 }
 EOL
 chown "${USERNAME}:www-data" /etc/aktechworks-net/config.json
 chmod 640 /etc/aktechworks-net/config.json
+
+# Pre-create the SQLite database file owned by www-data.
+# SQLite also creates journal/lock files in this directory during writes,
+# which is why the parent directory above is 770 (www-data writable).
+touch /etc/aktechworks-net/app.db
+chown www-data:www-data /etc/aktechworks-net/app.db
+chmod 660 /etc/aktechworks-net/app.db
+
+# Client cert storage — PHP (www-data) creates per-client subdirectories here
+# when a client is added. acme.sh and server.mike write cert files into those dirs.
+# setgid (2775) ensures subdirectories inherit webgroup so both www-data and
+# the admin user have read/write access.
+mkdir -p /etc/ssl/clients
+chown "${USERNAME}:webgroup" /etc/ssl/clients
+chmod 2775 /etc/ssl/clients
 
 # ============================================================
 # 9c. Git deployment repo
@@ -443,7 +500,7 @@ issue_and_install_cert() {
     # Staging:    high rate limits, untrusted cert — use for test deployments
     # Production: trusted cert, rate limited to 5/domain/week
     # ${ACME} --issue --staging \
-    ${ACME} --issue --staging \
+    ${ACME} --issue \
         -d "${DOMAIN}" -d "www.${DOMAIN}" \
         --dns dns_namecheap
     local RESULT=$?
