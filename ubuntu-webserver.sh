@@ -10,6 +10,7 @@
 # <UDF name="OFFICE_IP"          label="MSP office IPs — comma-separated IPs, CIDRs, or FQDNs (ports 22/80/443)"  example="203.0.113.10,203.0.113.11,host.example.com" />
 # <UDF name="NAMECHEAP_USERNAME" label="Namecheap account username (for DNS-01 cert validation via acme.sh)" />
 # <UDF name="NAMECHEAP_API_KEY"  label="Namecheap API key (find under Profile, Tools, Namecheap API)" />
+# <UDF name="CERT_STAGE"         label="Use Let's Encrypt Staging?" oneOf="yes,no" />
 
 # ============================================================
 # Init — verbose logging
@@ -23,6 +24,7 @@ echo "  USERNAME=${USERNAME}"
 echo "  PRIMARY_DOMAIN=${PRIMARY_DOMAIN}"
 echo "  ADMIN_EMAIL=${ADMIN_EMAIL}"
 echo "  OFFICE_IP=${OFFICE_IP}"
+echo "  CERT_STAGE=${CERT_STAGE}"
 
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -648,25 +650,20 @@ ACME="/root/.acme.sh/acme.sh"
 echo 'CURL_OPTS="-4"' >> /root/.acme.sh/account.conf
 
 # ============================================================
-# 11. Obtain SSL certificates via acme.sh — staging / test mode
+# 11. Obtain SSL certificates via acme.sh
 # ============================================================
-# STAGING MODE: --staging uses Let's Encrypt's staging CA.
+# Staging mode (CERT_STAGE=yes): uses Let's Encrypt's staging CA.
+#   - Full DNS-01 validation runs — complete cert workflow is exercised end-to-end.
+#   - Certs are installed and used by nginx (SSL config is fully tested).
+#   - Staging certs are NOT browser-trusted — expect an untrusted CA warning.
+#   - ~10x higher rate limits than production — safe for repeated test deployments.
 #
-#   - Full DNS-01 validation runs against Cloudflare — the complete cert
-#     workflow is exercised end-to-end on every test deployment.
-#   - Issued certs ARE installed and used by nginx (SSL config is fully tested).
-#   - Staging certs are NOT trusted by browsers — expect an untrusted CA warning.
-#   - Staging has ~10x higher rate limits than production, making it safe for
-#     repeated test deployments without risk of hitting the production rate
-#     limit (5 certs/domain/week).
-#
-# To promote to production certs after testing:
-#   export CF_Token=<your-token>
-#   /root/.acme.sh/acme.sh --issue --force \
-#       -d example.com -d www.example.com --dns dns_cf --server letsencrypt
-#   (acme.sh will automatically reload nginx via the installed --reloadcmd)
+# Production mode (CERT_STAGE=no): issues trusted certs (rate limited: 5/domain/week).
 
-echo "[11/13] Issuing SSL certificates (staging mode)..."
+ACME_STAGING_FLAG=""
+[ "${CERT_STAGE}" = "yes" ] && ACME_STAGING_FLAG="--staging"
+
+echo "[11/13] Issuing SSL certificates ($([ "${CERT_STAGE}" = "yes" ] && echo "staging" || echo "production") mode)..."
 
 # NAMECHEAP_SOURCEIP must match the IP whitelisted in your Namecheap API settings.
 # For a static Linode this is the server's own public IP, detected from the interface.
@@ -676,14 +673,10 @@ export NAMECHEAP_SOURCEIP=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K[\d.]+')
 
 issue_and_install_cert() {
     local DOMAIN="$1"
-    echo "Requesting staging cert for ${DOMAIN}..."
+    echo "Requesting cert for ${DOMAIN} (CERT_STAGE=${CERT_STAGE})..."
 
     set +e
-    # Toggle between staging and production by swapping which line is commented out.
-    # Staging:    high rate limits, untrusted cert — use for test deployments
-    # Production: trusted cert, rate limited to 5/domain/week
-    # ${ACME} --issue --staging \
-    ${ACME} --issue \
+    ${ACME} --issue ${ACME_STAGING_FLAG} \
         -d "${DOMAIN}" -d "www.${DOMAIN}" \
         --dns dns_namecheap
     local RESULT=$?
@@ -718,9 +711,9 @@ write_nginx_config() {
     local CONF="/etc/nginx/sites-available/${DOMAIN}"
 
     if [ -f "/etc/ssl/acme/${DOMAIN}/fullchain.pem" ]; then
-        # HTTPS config — staging cert was successfully issued and installed
+        # HTTPS config — cert was successfully issued and installed
         cat > "${CONF}" << EOL
-# ${DOMAIN} — HTTPS (staging cert)
+# ${DOMAIN} — HTTPS
 server {
     listen 80;
     server_name ${DOMAIN} www.${DOMAIN};
@@ -807,7 +800,11 @@ systemctl restart nginx
 # Summary
 # ============================================================
 cert_status() {
-    [ -f "/etc/ssl/acme/${1}/fullchain.pem" ] && echo "staging cert installed" || echo "HTTP only — cert failed"
+    if [ -f "/etc/ssl/acme/${1}/fullchain.pem" ]; then
+        [ "${CERT_STAGE}" = "yes" ] && echo "staging cert installed" || echo "production cert installed"
+    else
+        echo "HTTP only — cert failed"
+    fi
 }
 
 echo "======================================================"
@@ -819,6 +816,7 @@ echo "Firewall    : UFW — ports 22/80/443 restricted to ${OFFICE_IP}"
 echo ""
 echo "Domain      : ${PRIMARY_DOMAIN}  [$(cert_status ${PRIMARY_DOMAIN})]"
 echo ""
+if [ "${CERT_STAGE}" = "yes" ]; then
 echo "SSL note    : Certificates are in STAGING mode (not browser-trusted)."
 echo "              To issue production certs after testing:"
 echo "                export NAMECHEAP_USERNAME=<username>"
@@ -826,7 +824,10 @@ echo "                export NAMECHEAP_API_KEY=<key>"
 echo "                export NAMECHEAP_SOURCEIP=<this_server_ip>"
 echo "                /root/.acme.sh/acme.sh --issue --force \\"
 echo "                  -d ${PRIMARY_DOMAIN} -d www.${PRIMARY_DOMAIN} \\"
-echo "                  --dns dns_namecheap --server letsencrypt"
+echo "                  --dns dns_namecheap"
+else
+echo "SSL note    : Certificates issued in PRODUCTION mode (browser-trusted)."
+fi
 echo ""
 echo "Web roots   : /srv/www/<domain>/public/"
 echo "Config file : /etc/aktechworks-net/config.json (populate before first run)"
