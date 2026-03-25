@@ -49,6 +49,10 @@ echo "127.0.1.1 ${PRIMARY_DOMAIN} ${HOSTNAME}" >> /etc/hosts
 echo "[3/13] Setting timezone to America/Anchorage..."
 timedatectl set-timezone America/Anchorage
 
+# Prefer IPv4 for outbound connections — required for Cloudflare API token IP filtering,
+# which only allows the server's IPv4 address. Without this, curl uses IPv6 and gets rejected.
+sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
+
 # ============================================================
 # 4. Create admin user
 # ============================================================
@@ -92,7 +96,7 @@ apt-get install -y curl unzip git
 #   ldap     — Active Directory / LDAPS connections (php ldap_* extension)
 #   sqlite3  — SQLite app data store via PDO
 #   zip      — Composer package extraction
-apt-get install -y nginx php php-cli php-fpm php-mbstring php-xml php-curl php-ldap php-sqlite3 php-zip sqlite3
+apt-get install -y nginx php php-cli php-fpm php-mbstring php-xml php-curl php-ldap php-sqlite3 php-zip sqlite3 jq
 
 # Detect the installed PHP version — needed for the FPM socket path and service name
 PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
@@ -268,6 +272,176 @@ if [ "${DDNS_FOUND}" = "true" ]; then
     echo "DDNS tracking active for registered hostnames."
 fi
 
+# Install cert queue processor — issues certs via acme.sh for jobs written by the web app.
+echo "Installing cert queue processor..."
+
+cat > /usr/local/sbin/cert-queue-processor << 'SCRIPT'
+#!/bin/bash
+# Cert queue processor — processes pending cert issuance jobs written by the web app.
+# Runs as root via cron. Reads job files from /etc/aktechworks-net/cert-queue/,
+# fetches DNS credentials from Azure Key Vault, issues certs via acme.sh, and
+# updates the certificates table in SQLite.
+
+QUEUE_DIR="/etc/aktechworks-net/cert-queue"
+DB="/etc/aktechworks-net/app.db"
+CONFIG="/etc/aktechworks-net/config.json"
+PROVIDERS_JSON="/srv/www/aktechworks.net/config/api_providers.json"
+ACME="/root/.acme.sh/acme.sh"
+LOG="/var/log/cert-queue.log"
+
+log() {
+    echo "$(date -Iseconds) $*" >> "${LOG}"
+}
+
+TENANT_ID=$(jq -r '.key_vault.tenant_id' "${CONFIG}")
+KV_CLIENT_ID=$(jq -r '.key_vault.client_id' "${CONFIG}")
+KV_CLIENT_SECRET=$(jq -r '.key_vault.client_secret' "${CONFIG}")
+VAULT_URL=$(jq -r '.key_vault.vault_url' "${CONFIG}")
+
+get_access_token() {
+    local RESPONSE
+    RESPONSE=$(curl -s -X POST \
+        "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+        -d "grant_type=client_credentials&client_id=${KV_CLIENT_ID}&client_secret=${KV_CLIENT_SECRET}&scope=https://vault.azure.net/.default")
+    echo "${RESPONSE}" | jq -r '.access_token'
+}
+
+get_secret() {
+    local SECRET_NAME="$1"
+    local TOKEN="$2"
+    curl -s \
+        -H "Authorization: Bearer ${TOKEN}" \
+        "${VAULT_URL}/secrets/${SECRET_NAME}?api-version=7.4" | jq -r '.value'
+}
+
+shopt -s nullglob
+JOB_FILES=("${QUEUE_DIR}"/*.json)
+
+if [ ${#JOB_FILES[@]} -eq 0 ]; then
+    exit 0
+fi
+
+ACCESS_TOKEN=$(get_access_token)
+if [ -z "${ACCESS_TOKEN}" ] || [ "${ACCESS_TOKEN}" = "null" ]; then
+    log "ERROR: Failed to get Azure access token — aborting"
+    exit 1
+fi
+
+for JOB_FILE in "${JOB_FILES[@]}"; do
+    log "Processing: ${JOB_FILE}"
+
+    CERT_ID=$(jq -r '.cert_id'           "${JOB_FILE}")
+    CLIENT_SLUG=$(jq -r '.client_slug'   "${JOB_FILE}")
+    CLIENT_ID_NUM=$(jq -r '.client_id'   "${JOB_FILE}")
+    DOMAIN=$(jq -r '.domain'             "${JOB_FILE}")
+    CERT_TYPE=$(jq -r '.cert_type'       "${JOB_FILE}")
+    PROVIDER_SLUG=$(jq -r '.provider_slug' "${JOB_FILE}")
+    INSTANCE_NUM=$(jq -r '.instance_num' "${JOB_FILE}")
+    STAGING=$(jq -r '.staging'           "${JOB_FILE}")
+
+    if [ -z "${CERT_ID}" ] || [ -z "${DOMAIN}" ] || [ -z "${PROVIDER_SLUG}" ]; then
+        log "ERROR: malformed job file ${JOB_FILE} — skipping"
+        rm -f "${JOB_FILE}"
+        continue
+    fi
+
+    ACME_PLUGIN=$(jq -r ".\"${PROVIDER_SLUG}\".acme_plugin" "${PROVIDERS_JSON}")
+    if [ -z "${ACME_PLUGIN}" ] || [ "${ACME_PLUGIN}" = "null" ]; then
+        log "ERROR: cert ${CERT_ID}: no acme_plugin defined for provider ${PROVIDER_SLUG}"
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='No acme_plugin defined for provider: ${PROVIDER_SLUG}', last_updated=datetime('now') WHERE id=${CERT_ID}"
+        rm -f "${JOB_FILE}"
+        continue
+    fi
+
+    FETCH_FAILED=false
+    while IFS='|' read -r FIELD_SLUG VAULT_KEY; do
+        [ -z "${FIELD_SLUG}" ] && continue
+        ENV_VAR=$(jq -r ".\"${PROVIDER_SLUG}\".acme_env.\"${FIELD_SLUG}\"" "${PROVIDERS_JSON}")
+        if [ -z "${ENV_VAR}" ] || [ "${ENV_VAR}" = "null" ]; then
+            continue
+        fi
+        SECRET_VALUE=$(get_secret "${VAULT_KEY}" "${ACCESS_TOKEN}")
+        if [ -z "${SECRET_VALUE}" ] || [ "${SECRET_VALUE}" = "null" ]; then
+            log "ERROR: cert ${CERT_ID}: failed to fetch secret ${VAULT_KEY}"
+            FETCH_FAILED=true
+            break
+        fi
+        export "${ENV_VAR}=${SECRET_VALUE}"
+    done < <(sqlite3 "${DB}" "SELECT field_slug, vault_key FROM api_keys WHERE client_id=${CLIENT_ID_NUM} AND provider_slug='${PROVIDER_SLUG}' AND instance_num=${INSTANCE_NUM}")
+
+    if [ "${FETCH_FAILED}" = "true" ]; then
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='Failed to fetch credentials from Key Vault', last_updated=datetime('now') WHERE id=${CERT_ID}"
+        rm -f "${JOB_FILE}"
+        continue
+    fi
+
+    if [ "${ACME_PLUGIN}" = "dns_namecheap" ]; then
+        export NAMECHEAP_SOURCEIP
+        NAMECHEAP_SOURCEIP=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K[\d.]+')
+    fi
+
+    DOMAIN_FLAGS="-d ${DOMAIN}"
+    case "${CERT_TYPE}" in
+        wildcard)
+            DOMAIN_FLAGS="-d *.${DOMAIN} -d ${DOMAIN}"
+            ;;
+        san)
+            while IFS= read -r SAN; do
+                [ -z "${SAN}" ] && continue
+                DOMAIN_FLAGS="${DOMAIN_FLAGS} -d ${SAN}"
+            done < <(jq -r '.san_domains[]?' "${JOB_FILE}")
+            ;;
+    esac
+
+    STAGING_FLAG=""
+    [ "${STAGING}" = "true" ] && STAGING_FLAG="--staging"
+
+    CERT_DIR="/etc/ssl/clients/${CLIENT_SLUG}"
+    mkdir -p "${CERT_DIR}"
+
+    set +e
+    ${ACME} --issue ${DOMAIN_FLAGS} --dns ${ACME_PLUGIN} ${STAGING_FLAG}
+    ACME_RESULT=$?
+    set -e
+
+    if [ ${ACME_RESULT} -ne 0 ]; then
+        log "ERROR: cert ${CERT_ID}: acme.sh --issue exited ${ACME_RESULT}"
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='acme.sh exited with code ${ACME_RESULT}', last_updated=datetime('now') WHERE id=${CERT_ID}"
+        rm -f "${JOB_FILE}"
+        continue
+    fi
+
+    INSTALL_DOMAIN="${DOMAIN}"
+    [ "${CERT_TYPE}" = "wildcard" ] && INSTALL_DOMAIN="*.${DOMAIN}"
+
+    ${ACME} --install-cert -d "${INSTALL_DOMAIN}" \
+        --cert-file      "${CERT_DIR}/${DOMAIN}.crt" \
+        --key-file       "${CERT_DIR}/${DOMAIN}.key" \
+        --fullchain-file "${CERT_DIR}/${DOMAIN}-fullchain.crt"
+
+    EXPIRY_DATE=""
+    if [ -f "${CERT_DIR}/${DOMAIN}.crt" ]; then
+        EXPIRY_RAW=$(openssl x509 -enddate -noout -in "${CERT_DIR}/${DOMAIN}.crt" 2>/dev/null | sed 's/notAfter=//')
+        EXPIRY_DATE=$(date -d "${EXPIRY_RAW}" '+%Y-%m-%d' 2>/dev/null || echo "")
+    fi
+
+    sqlite3 "${DB}" "UPDATE certificates SET status='issued', expiry_date='${EXPIRY_DATE}', last_updated=datetime('now'), notes=NULL WHERE id=${CERT_ID}"
+
+    log "OK: cert ${CERT_ID} issued — ${DOMAIN} (${CERT_TYPE}), expiry ${EXPIRY_DATE}"
+    rm -f "${JOB_FILE}"
+done
+SCRIPT
+
+chmod 700 /usr/local/sbin/cert-queue-processor
+
+cat > /etc/cron.d/cert-queue << 'EOL'
+*/10 * * * * root /usr/local/sbin/cert-queue-processor
+EOL
+chmod 644 /etc/cron.d/cert-queue
+
+echo "Cert queue processor: /usr/local/sbin/cert-queue-processor"
+echo "Cron: every 10 minutes — log at /var/log/cert-queue.log"
+
 # ============================================================
 # 7. fail2ban (SSH brute-force protection)
 # ============================================================
@@ -417,6 +591,11 @@ EOL
 chown "${USERNAME}:www-data" /etc/aktechworks-net/config.json
 chmod 640 /etc/aktechworks-net/config.json
 
+# Cert queue — PHP (www-data) writes job files here; cert-queue-processor reads and deletes them.
+mkdir -p /etc/aktechworks-net/cert-queue
+chown www-data:www-data /etc/aktechworks-net/cert-queue
+chmod 770 /etc/aktechworks-net/cert-queue
+
 # Pre-create the SQLite database file owned by www-data.
 # SQLite also creates journal/lock files in this directory during writes,
 # which is why the parent directory above is 770 (www-data writable).
@@ -463,6 +642,10 @@ echo "To add remote locally: git remote add linode ${USERNAME}@${PRIMARY_DOMAIN}
 echo "[10/13] Installing acme.sh..."
 curl https://get.acme.sh | sh -s email="${ADMIN_EMAIL}"
 ACME="/root/.acme.sh/acme.sh"
+
+# Force IPv4 for all acme.sh API calls — avoids Cloudflare token IP filter
+# rejecting requests from the server's IPv6 address.
+echo 'CURL_OPTS="-4"' >> /root/.acme.sh/account.conf
 
 # ============================================================
 # 11. Obtain SSL certificates via acme.sh — staging / test mode
