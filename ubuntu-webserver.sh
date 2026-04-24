@@ -295,6 +295,8 @@ log() {
     echo "$(date -Iseconds) $*" >> "${LOG}"
 }
 
+# ---- Azure Key Vault helpers ----
+
 TENANT_ID=$(jq -r '.key_vault.tenant_id' "${CONFIG}")
 KV_CLIENT_ID=$(jq -r '.key_vault.client_id' "${CONFIG}")
 KV_CLIENT_SECRET=$(jq -r '.key_vault.client_secret' "${CONFIG}")
@@ -316,6 +318,8 @@ get_secret() {
         "${VAULT_URL}/secrets/${SECRET_NAME}?api-version=7.4" | jq -r '.value'
 }
 
+# ---- Main ----
+
 shopt -s nullglob
 JOB_FILES=("${QUEUE_DIR}"/*.json)
 
@@ -332,29 +336,33 @@ fi
 for JOB_FILE in "${JOB_FILES[@]}"; do
     log "Processing: ${JOB_FILE}"
 
-    CERT_ID=$(jq -r '.cert_id'           "${JOB_FILE}")
-    CLIENT_SLUG=$(jq -r '.client_slug'   "${JOB_FILE}")
-    CLIENT_ID_NUM=$(jq -r '.client_id'   "${JOB_FILE}")
-    DOMAIN=$(jq -r '.domain'             "${JOB_FILE}")
-    CERT_TYPE=$(jq -r '.cert_type'       "${JOB_FILE}")
+    CERT_ID=$(jq -r '.cert_id'      "${JOB_FILE}")
+    CLIENT_SLUG=$(jq -r '.client_slug'  "${JOB_FILE}")
+    CLIENT_ID_NUM=$(jq -r '.client_id'  "${JOB_FILE}")
+    DOMAIN=$(jq -r '.domain'        "${JOB_FILE}")
+    CERT_TYPE=$(jq -r '.cert_type'  "${JOB_FILE}")
     PROVIDER_SLUG=$(jq -r '.provider_slug' "${JOB_FILE}")
-    INSTANCE_NUM=$(jq -r '.instance_num' "${JOB_FILE}")
-    STAGING=$(jq -r '.staging'           "${JOB_FILE}")
+    INSTANCE_NUM=$(jq -r '.instance_num'   "${JOB_FILE}")
+    STAGING=$(jq -r '.staging'      "${JOB_FILE}")
+    FORCE=$(jq -r '.force'          "${JOB_FILE}")
 
+    # Validate required fields
     if [ -z "${CERT_ID}" ] || [ -z "${DOMAIN}" ] || [ -z "${PROVIDER_SLUG}" ]; then
         log "ERROR: malformed job file ${JOB_FILE} — skipping"
         rm -f "${JOB_FILE}"
         continue
     fi
 
+    # Get acme plugin name from providers JSON
     ACME_PLUGIN=$(jq -r ".\"${PROVIDER_SLUG}\".acme_plugin" "${PROVIDERS_JSON}")
     if [ -z "${ACME_PLUGIN}" ] || [ "${ACME_PLUGIN}" = "null" ]; then
         log "ERROR: cert ${CERT_ID}: no acme_plugin defined for provider ${PROVIDER_SLUG}"
-        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='No acme_plugin defined for provider: ${PROVIDER_SLUG}', last_updated=datetime('now') WHERE id=${CERT_ID}"
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='No acme_plugin defined for provider: ${PROVIDER_SLUG}', last_updated=datetime('now', 'localtime') WHERE id=${CERT_ID}"
         rm -f "${JOB_FILE}"
         continue
     fi
 
+    # Fetch vault keys for this client + provider + instance, set env vars
     FETCH_FAILED=false
     while IFS='|' read -r FIELD_SLUG VAULT_KEY; do
         [ -z "${FIELD_SLUG}" ] && continue
@@ -372,25 +380,29 @@ for JOB_FILE in "${JOB_FILES[@]}"; do
     done < <(sqlite3 "${DB}" "SELECT field_slug, vault_key FROM api_keys WHERE client_id=${CLIENT_ID_NUM} AND provider_slug='${PROVIDER_SLUG}' AND instance_num=${INSTANCE_NUM}")
 
     if [ "${FETCH_FAILED}" = "true" ]; then
-        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='Failed to fetch credentials from Key Vault', last_updated=datetime('now') WHERE id=${CERT_ID}"
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='Failed to fetch credentials from Key Vault', last_updated=datetime('now', 'localtime') WHERE id=${CERT_ID}"
         rm -f "${JOB_FILE}"
         continue
     fi
 
+    # Namecheap requires source IP matching the API whitelist
     if [ "${ACME_PLUGIN}" = "dns_namecheap" ]; then
         export NAMECHEAP_SOURCEIP
         NAMECHEAP_SOURCEIP=$(ip -4 route get 1.1.1.1 | grep -oP 'src \K[\d.]+')
     fi
 
-    DOMAIN_FLAGS="-d ${DOMAIN}"
+    # Build domain flags for acme.sh — use array to prevent glob expansion of wildcards
+    # Wildcard domains are stored as *.domain.com; strip prefix for base domain flag
+    DOMAIN_FLAGS=(-d "${DOMAIN}")
     case "${CERT_TYPE}" in
         wildcard)
-            DOMAIN_FLAGS="-d *.${DOMAIN} -d ${DOMAIN}"
+            BASE_DOMAIN="${DOMAIN#\*.}"
+            DOMAIN_FLAGS=(-d "${DOMAIN}" -d "${BASE_DOMAIN}")
             ;;
         san)
             while IFS= read -r SAN; do
                 [ -z "${SAN}" ] && continue
-                DOMAIN_FLAGS="${DOMAIN_FLAGS} -d ${SAN}"
+                DOMAIN_FLAGS+=(-d "${SAN}")
             done < <(jq -r '.san_domains[]?' "${JOB_FILE}")
             ;;
     esac
@@ -398,36 +410,72 @@ for JOB_FILE in "${JOB_FILES[@]}"; do
     STAGING_FLAG=""
     [ "${STAGING}" = "true" ] && STAGING_FLAG="--staging"
 
+    FORCE_FLAG=""
+    [ "${FORCE}" = "true" ] && FORCE_FLAG="--force"
+
+    # Run acme.sh --issue
     CERT_DIR="/etc/ssl/clients/${CLIENT_SLUG}"
     mkdir -p "${CERT_DIR}"
 
     set +e
-    ${ACME} --issue ${DOMAIN_FLAGS} --dns ${ACME_PLUGIN} ${STAGING_FLAG}
+    log "acme.sh command: ${ACME} --issue ${DOMAIN_FLAGS[*]} --dns ${ACME_PLUGIN} ${STAGING_FLAG} ${FORCE_FLAG}"
+    ACME_OUTPUT=$(${ACME} --issue "${DOMAIN_FLAGS[@]}" --dns ${ACME_PLUGIN} ${STAGING_FLAG} ${FORCE_FLAG} 2>&1)
     ACME_RESULT=$?
     set -e
 
-    if [ ${ACME_RESULT} -ne 0 ]; then
+    log "acme.sh output: ${ACME_OUTPUT}"
+
+    # Exit 0 = issued, exit 2 = already valid (skipped renewal) — both proceed to install
+    if [ ${ACME_RESULT} -ne 0 ] && [ ${ACME_RESULT} -ne 2 ]; then
         log "ERROR: cert ${CERT_ID}: acme.sh --issue exited ${ACME_RESULT}"
-        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='acme.sh exited with code ${ACME_RESULT}', last_updated=datetime('now') WHERE id=${CERT_ID}"
+        SAFE_OUTPUT=$(echo "${ACME_OUTPUT}" | tail -3 | tr "'" '"')
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='${SAFE_OUTPUT}', last_updated=datetime('now', 'localtime') WHERE id=${CERT_ID}"
         rm -f "${JOB_FILE}"
         continue
     fi
 
+    # Install cert files to client directory
+    # DOMAIN already includes *. prefix for wildcard certs
     INSTALL_DOMAIN="${DOMAIN}"
-    [ "${CERT_TYPE}" = "wildcard" ] && INSTALL_DOMAIN="*.${DOMAIN}"
 
-    ${ACME} --install-cert -d "${INSTALL_DOMAIN}" \
-        --cert-file      "${CERT_DIR}/${DOMAIN}.crt" \
-        --key-file       "${CERT_DIR}/${DOMAIN}.key" \
-        --fullchain-file "${CERT_DIR}/${DOMAIN}-fullchain.crt"
+    set +e
+    INSTALL_OUTPUT=$(${ACME} --install-cert -d "${INSTALL_DOMAIN}" \
+        --cert-file      "${CERT_DIR}/${CERT_ID}.crt" \
+        --key-file       "${CERT_DIR}/${CERT_ID}.key" \
+        --fullchain-file "${CERT_DIR}/${CERT_ID}-fullchain.crt" 2>&1)
+    INSTALL_RESULT=$?
+    set -e
 
-    EXPIRY_DATE=""
-    if [ -f "${CERT_DIR}/${DOMAIN}.crt" ]; then
-        EXPIRY_RAW=$(openssl x509 -enddate -noout -in "${CERT_DIR}/${DOMAIN}.crt" 2>/dev/null | sed 's/notAfter=//')
-        EXPIRY_DATE=$(date -d "${EXPIRY_RAW}" '+%Y-%m-%d' 2>/dev/null || echo "")
+    if [ ${INSTALL_RESULT} -ne 0 ]; then
+        log "ERROR: cert ${CERT_ID}: acme.sh --install-cert failed: ${INSTALL_OUTPUT}"
+        sqlite3 "${DB}" "UPDATE certificates SET status='error', notes='install-cert failed: ${INSTALL_RESULT}', last_updated=datetime('now', 'localtime') WHERE id=${CERT_ID}"
+        rm -f "${JOB_FILE}"
+        continue
     fi
 
-    sqlite3 "${DB}" "UPDATE certificates SET status='issued', expiry_date='${EXPIRY_DATE}', last_updated=datetime('now'), notes=NULL WHERE id=${CERT_ID}"
+    # Allow www-data to read the key file for PFX generation
+    chown root:www-data "${CERT_DIR}/${CERT_ID}.key"
+    chmod 640 "${CERT_DIR}/${CERT_ID}.key"
+
+    # Read expiry date and thumbprint from issued cert
+    EXPIRY_DATE=""
+    THUMB=""
+    if [ -f "${CERT_DIR}/${CERT_ID}.crt" ]; then
+        EXPIRY_RAW=$(openssl x509 -enddate -noout -in "${CERT_DIR}/${CERT_ID}.crt" 2>/dev/null | sed 's/notAfter=//')
+        EXPIRY_DATE=$(date -d "${EXPIRY_RAW}" '+%Y-%m-%d' 2>/dev/null || echo "")
+        THUMB=$(openssl x509 -fingerprint -sha256 -noout -in "${CERT_DIR}/${CERT_ID}.crt" 2>/dev/null \
+            | sed 's/.*Fingerprint=//' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+    fi
+
+    sqlite3 "${DB}" "UPDATE certificates SET status='issued', expiry_date='${EXPIRY_DATE}', thumbprint='${THUMB}', last_updated=datetime('now', 'localtime'), notes=NULL WHERE id=${CERT_ID}"
+
+    # Remove superseded certs for this client + domain
+    OLD_IDS=$(sqlite3 "${DB}" "SELECT id FROM certificates WHERE client_id=${CLIENT_ID_NUM} AND domain='${DOMAIN}' AND status='issued' AND id != ${CERT_ID}")
+    for OLD_ID in ${OLD_IDS}; do
+        rm -f "${CERT_DIR}/${OLD_ID}.crt" "${CERT_DIR}/${OLD_ID}.key" "${CERT_DIR}/${OLD_ID}-fullchain.crt"
+        sqlite3 "${DB}" "DELETE FROM certificates WHERE id=${OLD_ID}"
+        log "Removed superseded cert ${OLD_ID} for ${DOMAIN}"
+    done
 
     log "OK: cert ${CERT_ID} issued — ${DOMAIN} (${CERT_TYPE}), expiry ${EXPIRY_DATE}"
     rm -f "${JOB_FILE}"
@@ -436,13 +484,116 @@ SCRIPT
 
 chmod 700 /usr/local/sbin/cert-queue-processor
 
+# Install cert renewal scheduler — queues renewal jobs for certs expiring within 30 days.
+echo "Installing cert renewal scheduler..."
+
+cat > /usr/local/sbin/cert-renewal-scheduler << 'SCRIPT'
+#!/bin/bash
+# Cert renewal scheduler — queues renewal jobs for certs expiring within 30 days.
+# Runs as root via cron (daily). Skips certs that already have a pending job file.
+# The existing cert-queue-processor handles the actual renewal via acme.sh.
+
+QUEUE_DIR="/etc/aktechworks-net/cert-queue"
+DB="/etc/aktechworks-net/app.db"
+LOG="/var/log/cert-queue.log"
+RENEWAL_WINDOW_DAYS=30
+
+log() {
+    echo "$(date -Iseconds) [renewal-scheduler] $*" >> "${LOG}"
+}
+
+# Query certs due for renewal: issued, expiry within window (or expiry missing)
+CERTS=$(sqlite3 "${DB}" "
+    SELECT
+        c.id,
+        c.client_id,
+        cl.slug,
+        c.domain,
+        c.cert_type,
+        COALESCE(c.san_domains, ''),
+        c.provider_slug,
+        c.instance_num,
+        COALESCE(c.expiry_date, 'unknown')
+    FROM certificates c
+    JOIN clients cl ON cl.id = c.client_id
+    WHERE c.status = 'issued'
+      AND cl.active = 1
+      AND (
+          c.expiry_date IS NULL
+          OR c.expiry_date <= date('now', '+${RENEWAL_WINDOW_DAYS} days')
+      )
+    ORDER BY c.expiry_date ASC
+" 2>/dev/null)
+
+if [ -z "${CERTS}" ]; then
+    exit 0
+fi
+
+QUEUED=0
+SKIPPED=0
+
+while IFS='|' read -r CERT_ID CLIENT_ID CLIENT_SLUG DOMAIN CERT_TYPE SAN_DOMAINS_CSV PROVIDER_SLUG INSTANCE_NUM EXPIRY_DATE; do
+    JOB_FILE="${QUEUE_DIR}/${CERT_ID}.json"
+
+    # Skip if already queued
+    if [ -f "${JOB_FILE}" ]; then
+        log "SKIP: cert ${CERT_ID} (${DOMAIN}) — job already pending"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    # Convert comma-separated SANs to JSON array
+    if [ -n "${SAN_DOMAINS_CSV}" ]; then
+        SAN_JSON=$(echo "${SAN_DOMAINS_CSV}" | tr ',' '\n' | jq -R . | jq -s .)
+    else
+        SAN_JSON="[]"
+    fi
+
+    jq -n \
+        --argjson cert_id      "${CERT_ID}" \
+        --argjson client_id    "${CLIENT_ID}" \
+        --arg     client_slug  "${CLIENT_SLUG}" \
+        --arg     domain       "${DOMAIN}" \
+        --arg     cert_type    "${CERT_TYPE}" \
+        --argjson san_domains  "${SAN_JSON}" \
+        --arg     provider_slug "${PROVIDER_SLUG}" \
+        --argjson instance_num "${INSTANCE_NUM}" \
+        '{
+            cert_id:       $cert_id,
+            client_id:     $client_id,
+            client_slug:   $client_slug,
+            domain:        $domain,
+            cert_type:     $cert_type,
+            san_domains:   $san_domains,
+            provider_slug: $provider_slug,
+            instance_num:  $instance_num,
+            staging:       false,
+            force:         false
+        }' > "${JOB_FILE}"
+
+    log "QUEUED: cert ${CERT_ID} (${DOMAIN}, expiry ${EXPIRY_DATE})"
+    QUEUED=$((QUEUED + 1))
+
+done <<< "${CERTS}"
+
+if [ $((QUEUED + SKIPPED)) -gt 0 ]; then
+    log "Done — queued ${QUEUED}, skipped ${SKIPPED} already-pending"
+fi
+SCRIPT
+
+chmod 700 /usr/local/sbin/cert-renewal-scheduler
+
 cat > /etc/cron.d/cert-queue << 'EOL'
+# Renewal scheduler runs daily and queues jobs for expiring certs
+0 2 * * * root /usr/local/sbin/cert-renewal-scheduler
+# Queue processor runs every 10 minutes to handle manual and renewal requests promptly
 */10 * * * * root /usr/local/sbin/cert-queue-processor
 EOL
 chmod 644 /etc/cron.d/cert-queue
 
 echo "Cert queue processor: /usr/local/sbin/cert-queue-processor"
-echo "Cron: every 10 minutes — log at /var/log/cert-queue.log"
+echo "Cert renewal scheduler: /usr/local/sbin/cert-renewal-scheduler"
+echo "Cron: processor every 10 min, scheduler daily at 2:00 AM — log at /var/log/cert-queue.log"
 
 # ============================================================
 # 7. fail2ban (SSH brute-force protection)
@@ -604,6 +755,7 @@ chmod 770 /etc/aktechworks-net/cert-queue
 touch /etc/aktechworks-net/app.db
 chown www-data:www-data /etc/aktechworks-net/app.db
 chmod 660 /etc/aktechworks-net/app.db
+sqlite3 /etc/aktechworks-net/app.db "PRAGMA journal_mode=WAL"
 
 # Client cert storage — PHP (www-data) creates per-client subdirectories here
 # when a client is added. acme.sh and server.mike write cert files into those dirs.
@@ -632,6 +784,10 @@ GIT_WORK_TREE=/srv/www/${PRIMARY_DOMAIN} git checkout -f main
 cd /srv/www/${PRIMARY_DOMAIN}
 composer install --no-dev --optimize-autoloader
 systemctl reload php${PHP_VERSION}-fpm
+cp /srv/www/${PRIMARY_DOMAIN}/bin/cert-queue-processor /usr/local/sbin/cert-queue-processor
+chmod 700 /usr/local/sbin/cert-queue-processor
+cp /srv/www/${PRIMARY_DOMAIN}/bin/cert-renewal-scheduler /usr/local/sbin/cert-renewal-scheduler
+chmod 700 /usr/local/sbin/cert-renewal-scheduler
 HOOK
 
 chmod +x /srv/git/aktechworks-net.git/hooks/post-receive
