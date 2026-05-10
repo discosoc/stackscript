@@ -595,6 +595,15 @@ echo "Cert queue processor: /usr/local/sbin/cert-queue-processor"
 echo "Cert renewal scheduler: /usr/local/sbin/cert-renewal-scheduler"
 echo "Cron: processor every 10 min, scheduler daily at 2:00 AM — log at /var/log/cert-queue.log"
 
+cat > /etc/cron.d/report-mailer << 'EOL'
+# Scheduled report mailer — sends due report subscriptions every 15 minutes
+*/15 * * * * root /usr/local/sbin/report-mailer >> /var/log/report-mailer.log 2>&1
+EOL
+chmod 644 /etc/cron.d/report-mailer
+
+echo "Report mailer: /usr/local/sbin/report-mailer"
+echo "Cron: every 15 min — log at /var/log/report-mailer.log"
+
 # ============================================================
 # 7. fail2ban (SSH brute-force protection)
 # ============================================================
@@ -788,6 +797,8 @@ cp /srv/www/${PRIMARY_DOMAIN}/bin/cert-queue-processor /usr/local/sbin/cert-queu
 chmod 700 /usr/local/sbin/cert-queue-processor
 cp /srv/www/${PRIMARY_DOMAIN}/bin/cert-renewal-scheduler /usr/local/sbin/cert-renewal-scheduler
 chmod 700 /usr/local/sbin/cert-renewal-scheduler
+cp /srv/www/${PRIMARY_DOMAIN}/bin/report-mailer /usr/local/sbin/report-mailer
+chmod 700 /usr/local/sbin/report-mailer
 HOOK
 
 chmod +x /srv/git/aktechworks-net.git/hooks/post-receive
