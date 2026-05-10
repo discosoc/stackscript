@@ -800,13 +800,17 @@ mkdir -p /srv/git/aktechworks-net.git
 git init --bare /srv/git/aktechworks-net.git
 chown -R "${USERNAME}:${USERNAME}" /srv/git/aktechworks-net.git
 
+# Allow the admin user to reload PHP-FPM from the post-receive hook without a password prompt
+echo "${USERNAME} ALL=(root) NOPASSWD: /usr/bin/systemctl reload php${PHP_VERSION}-fpm" > /etc/sudoers.d/${USERNAME}-fpm
+chmod 440 /etc/sudoers.d/${USERNAME}-fpm
+
 # post-receive hook — PHP_VERSION and PRIMARY_DOMAIN are baked in at provisioning time
 cat > /srv/git/aktechworks-net.git/hooks/post-receive << HOOK
 #!/bin/bash
 GIT_WORK_TREE=/srv/www/${PRIMARY_DOMAIN} git checkout -f main
 cd /srv/www/${PRIMARY_DOMAIN}
 composer install --no-dev --optimize-autoloader
-systemctl reload php${PHP_VERSION}-fpm
+sudo systemctl reload php${PHP_VERSION}-fpm
 HOOK
 
 chmod +x /srv/git/aktechworks-net.git/hooks/post-receive
