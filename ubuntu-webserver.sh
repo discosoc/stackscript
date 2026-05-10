@@ -15,7 +15,6 @@
 # ============================================================
 # Init — verbose logging
 # ============================================================
-set -x
 exec > >(tee -a /root/stackscript.log) 2>&1
 
 echo "StackScript starting at $(date)"
@@ -61,6 +60,10 @@ sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc
 echo "[4/13] Creating user: ${USERNAME}..."
 if [ -z "${USERNAME}" ]; then
     echo "ERROR: USERNAME is empty"
+    exit 1
+fi
+if [ -z "${PASSWORD}" ]; then
+    echo "ERROR: PASSWORD is empty"
     exit 1
 fi
 useradd -m -s /bin/bash "${USERNAME}"
@@ -145,7 +148,11 @@ resolve_to_ipv4() {
         local RESOLVED
         RESOLVED=$(getent hosts "${VALUE}" 2>/dev/null | awk '{print $1}' | grep -v ':' | head -1)
         if [ -n "${RESOLVED}" ]; then
-            echo "${RESOLVED}"
+            if echo "${RESOLVED}" | grep -qE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)'; then
+                echo "WARNING: '${VALUE}' resolved to private/loopback address ${RESOLVED} — skipping" >&2
+            else
+                echo "${RESOLVED}"
+            fi
         else
             echo "WARNING: Could not resolve '${VALUE}' — skipping" >&2
         fi
@@ -304,7 +311,7 @@ VAULT_URL=$(jq -r '.key_vault.vault_url' "${CONFIG}")
 
 get_access_token() {
     local RESPONSE
-    RESPONSE=$(curl -s -X POST \
+    RESPONSE=$(curl -s --connect-timeout 5 -m 15 -X POST \
         "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
         -d "grant_type=client_credentials&client_id=${KV_CLIENT_ID}&client_secret=${KV_CLIENT_SECRET}&scope=https://vault.azure.net/.default")
     echo "${RESPONSE}" | jq -r '.access_token'
@@ -313,7 +320,7 @@ get_access_token() {
 get_secret() {
     local SECRET_NAME="$1"
     local TOKEN="$2"
-    curl -s \
+    curl -s --connect-timeout 5 -m 15 \
         -H "Authorization: Bearer ${TOKEN}" \
         "${VAULT_URL}/secrets/${SECRET_NAME}?api-version=7.4" | jq -r '.value'
 }
@@ -346,9 +353,16 @@ for JOB_FILE in "${JOB_FILES[@]}"; do
     STAGING=$(jq -r '.staging'      "${JOB_FILE}")
     FORCE=$(jq -r '.force'          "${JOB_FILE}")
 
-    # Validate required fields
-    if [ -z "${CERT_ID}" ] || [ -z "${DOMAIN}" ] || [ -z "${PROVIDER_SLUG}" ]; then
-        log "ERROR: malformed job file ${JOB_FILE} — skipping"
+    # Validate required fields — presence and safe format (guards SQL interpolation below)
+    VALID=true
+    [[ "${CERT_ID}"       =~ ^[0-9]+$        ]] || { log "ERROR: invalid cert_id '${CERT_ID}' in ${JOB_FILE}";             VALID=false; }
+    [[ "${CLIENT_ID_NUM}" =~ ^[0-9]+$        ]] || { log "ERROR: invalid client_id '${CLIENT_ID_NUM}' in ${JOB_FILE}";     VALID=false; }
+    [[ "${INSTANCE_NUM}"  =~ ^[0-9]+$        ]] || { log "ERROR: invalid instance_num '${INSTANCE_NUM}' in ${JOB_FILE}";   VALID=false; }
+    [[ "${PROVIDER_SLUG}" =~ ^[a-z0-9_-]+$  ]] || { log "ERROR: invalid provider_slug '${PROVIDER_SLUG}' in ${JOB_FILE}"; VALID=false; }
+    [[ "${CLIENT_SLUG}"   =~ ^[a-z0-9_-]+$  ]] || { log "ERROR: invalid client_slug '${CLIENT_SLUG}' in ${JOB_FILE}";     VALID=false; }
+    [[ "${DOMAIN}"        =~ ^[a-zA-Z0-9*._-]+$ ]] || { log "ERROR: invalid domain '${DOMAIN}' in ${JOB_FILE}";           VALID=false; }
+    [[ "${CERT_TYPE}"     =~ ^[a-z]+$        ]] || { log "ERROR: invalid cert_type '${CERT_TYPE}' in ${JOB_FILE}";         VALID=false; }
+    if [ "${VALID}" = "false" ]; then
         rm -f "${JOB_FILE}"
         continue
     fi
@@ -419,7 +433,7 @@ for JOB_FILE in "${JOB_FILES[@]}"; do
 
     set +e
     log "acme.sh command: ${ACME} --issue ${DOMAIN_FLAGS[*]} --dns ${ACME_PLUGIN} ${STAGING_FLAG} ${FORCE_FLAG}"
-    ACME_OUTPUT=$(${ACME} --issue "${DOMAIN_FLAGS[@]}" --dns ${ACME_PLUGIN} ${STAGING_FLAG} ${FORCE_FLAG} 2>&1)
+    ACME_OUTPUT=$(${ACME} --issue "${DOMAIN_FLAGS[@]}" --dns "${ACME_PLUGIN}" ${STAGING_FLAG} ${FORCE_FLAG} 2>&1)
     ACME_RESULT=$?
     set -e
 
@@ -655,7 +669,7 @@ MaxAuthTries 4
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
 
-PasswordAuthentication yes
+PasswordAuthentication no
 PermitEmptyPasswords no
 KbdInteractiveAuthentication no
 
@@ -793,12 +807,6 @@ GIT_WORK_TREE=/srv/www/${PRIMARY_DOMAIN} git checkout -f main
 cd /srv/www/${PRIMARY_DOMAIN}
 composer install --no-dev --optimize-autoloader
 systemctl reload php${PHP_VERSION}-fpm
-cp /srv/www/${PRIMARY_DOMAIN}/bin/cert-queue-processor /usr/local/sbin/cert-queue-processor
-chmod 700 /usr/local/sbin/cert-queue-processor
-cp /srv/www/${PRIMARY_DOMAIN}/bin/cert-renewal-scheduler /usr/local/sbin/cert-renewal-scheduler
-chmod 700 /usr/local/sbin/cert-renewal-scheduler
-cp /srv/www/${PRIMARY_DOMAIN}/bin/report-mailer /usr/local/sbin/report-mailer
-chmod 700 /usr/local/sbin/report-mailer
 HOOK
 
 chmod +x /srv/git/aktechworks-net.git/hooks/post-receive
