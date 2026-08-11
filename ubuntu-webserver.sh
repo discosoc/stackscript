@@ -609,6 +609,177 @@ echo "Cert queue processor: /usr/local/sbin/cert-queue-processor"
 echo "Cert renewal scheduler: /usr/local/sbin/cert-renewal-scheduler"
 echo "Cron: processor every 10 min, scheduler daily at 2:00 AM — log at /var/log/cert-queue.log"
 
+# Install report mailer — sends scheduled reports via SMTP2GO for due subscriptions.
+# This is an initial copy baked in at provision time; the app's own bin/report-mailer
+# is the source of truth going forward — re-copy after any push that changes it
+# (post-receive cannot sudo, so this doesn't happen automatically):
+#   sudo cp /srv/www/aktechworks.net/bin/report-mailer /usr/local/sbin/report-mailer
+#   sudo chmod 700 /usr/local/sbin/report-mailer
+echo "Installing report mailer..."
+
+cat > /usr/local/sbin/report-mailer << 'SCRIPT'
+#!/usr/bin/env php
+<?php
+// Report mailer — sends scheduled reports via SMTP2GO.
+// Runs as root via cron every 15 minutes.
+// Cron entry: */15 * * * * root /usr/local/sbin/report-mailer >> /var/log/report-mailer.log 2>&1
+
+date_default_timezone_set('America/Anchorage');
+
+define('APP_ROOT', '/srv/www/aktechworks.net');
+
+require APP_ROOT . '/vendor/autoload.php';
+
+use App\Database;
+use App\HuntressSat;
+use App\KeyVault;
+use App\Mailer;
+use App\Reports\HuntressSatReport;
+use App\Handlers\ManageReportSubscription;
+
+function log_msg(string $msg): void
+{
+    echo date('c') . ' ' . $msg . "\n";
+}
+
+$config = json_decode(file_get_contents('/etc/aktechworks-net/config.json'), true);
+$db     = Database::get();
+$vault  = new KeyVault($config);
+$mailer = new Mailer($config);
+
+$subs = $db->query("
+    SELECT rs.*, c.name AS client_name, c.slug AS client_slug
+    FROM report_subscriptions rs
+    JOIN clients c ON c.id = rs.client_id
+    WHERE rs.enabled = 1
+      AND rs.client_id IS NOT NULL
+      AND (rs.next_run_at IS NULL OR rs.next_run_at <= datetime('now', 'localtime'))
+")->fetchAll();
+
+if (empty($subs)) {
+    exit(0);
+}
+
+foreach ($subs as $sub) {
+    $subId      = (int) $sub['id'];
+    $reportKey  = $sub['report_key'];
+    $clientId   = (int) $sub['client_id'];
+    $clientName = $sub['client_name'];
+    $clientSlug = $sub['client_slug'];
+    $recipients = json_decode($sub['recipients'], true) ?? [];
+
+    log_msg("Processing subscription {$subId}: {$reportKey} for {$clientName}");
+
+    try {
+        if (empty($recipients)) {
+            throw new \RuntimeException('No recipients configured.');
+        }
+
+        if ($reportKey === 'huntress-sat') {
+            sendHuntressSatReport($sub, $recipients, $config, $vault, $mailer, $clientName, $clientSlug);
+        } else {
+            throw new \RuntimeException("Unknown report_key: {$reportKey}");
+        }
+
+        if ($sub['schedule_type'] === 'biweekly') {
+            $anchor  = new \DateTime($sub['next_run_at']);
+            $anchor->modify('+14 days');
+            $nextRun = $anchor->format('Y-m-d H:i:s');
+        } else {
+            $nextRun = ManageReportSubscription::computeNextRunAt(
+                $sub['schedule_type'],
+                $sub['schedule_day'] !== null ? (int) $sub['schedule_day'] : null,
+                $sub['schedule_time']
+            );
+        }
+
+        $db->prepare("
+            UPDATE report_subscriptions SET last_run_at = datetime('now', 'localtime'), next_run_at = ? WHERE id = ?
+        ")->execute([$nextRun, $subId]);
+
+        log_msg("OK: sent to " . implode(', ', $recipients) . " — next run {$nextRun}");
+
+    } catch (\Throwable $e) {
+        log_msg("ERROR subscription {$subId}: " . $e->getMessage());
+    }
+}
+
+function sendHuntressSatReport(
+    array $sub, array $recipients, array $config,
+    KeyVault $vault, Mailer $mailer,
+    string $clientName, string $clientSlug
+): void {
+    $satCfg       = $config['huntress_sat'] ?? [];
+    $clientAppId  = $satCfg['client_id']     ?? '';
+    $clientSecret = $satCfg['client_secret'] ?? '';
+
+    if (!$clientAppId || !$clientSecret) {
+        throw new \RuntimeException('Huntress SAT credentials not configured.');
+    }
+
+    $db   = Database::get();
+    $stmt = $db->prepare("
+        SELECT vault_key FROM api_keys
+        WHERE client_id = ? AND provider_slug = 'huntress-sat' AND instance_num = 1 AND field_slug = 'account-id'
+    ");
+    $stmt->execute([$sub['client_id']]);
+    $vaultKey = $stmt->fetchColumn();
+
+    if (!$vaultKey) {
+        throw new \RuntimeException("No Huntress SAT account-id configured for client {$sub['client_id']}.");
+    }
+
+    $accountId = $vault->getSecret($vaultKey);
+
+    $sat  = new HuntressSat($clientAppId, $clientSecret);
+    $csvs = HuntressSatReport::buildAll($sat, $accountId);
+
+    $date        = date('Y-m-d');
+    $attachments = [
+        [
+            'filename' => 'active.csv',
+            'fileblob' => base64_encode($csvs['active']),
+            'mimetype' => 'text/csv',
+        ],
+        [
+            'filename' => 'baseline.csv',
+            'fileblob' => base64_encode($csvs['baseline']),
+            'mimetype' => 'text/csv',
+        ],
+        [
+            'filename' => 'full.csv',
+            'fileblob' => base64_encode($csvs['history']),
+            'mimetype' => 'text/csv',
+        ],
+    ];
+
+    $subject = "Cybersecurity Training Report — {$clientName}";
+    $body    = implode('', [
+        '<p>Attached are Cybersecurity training reports for all ',
+        htmlspecialchars($clientName),
+        ' users with incomplete training progress.</p>',
+        '<ul>',
+        '<li><strong>active.csv</strong> — Users with currently active incomplete assignments</li>',
+        '<li><strong>baseline.csv</strong> — Users with incomplete baseline training</li>',
+        '<li><strong>full.csv</strong> — Complete training history for ' . date('Y') . ', including expired modules that can no longer be taken.</li>',
+        '</ul>',
+        '<p style="color:#888;font-size:0.9em;">Generated ' . $date . ' by Alaska Techworks Portal.</p>',
+    ]);
+
+    $mailer->send(
+        $recipients,
+        $subject,
+        $body,
+        $sub['from_email'],
+        $sub['from_name'] ?? '',
+        $sub['reply_to']  ?? '',
+        $attachments
+    );
+}
+SCRIPT
+
+chmod 700 /usr/local/sbin/report-mailer
+
 cat > /etc/cron.d/report-mailer << 'EOL'
 # Scheduled report mailer — sends due report subscriptions every 15 minutes
 */15 * * * * root /usr/local/sbin/report-mailer >> /var/log/report-mailer.log 2>&1
@@ -680,18 +851,8 @@ TCPKeepAlive yes
 
 AcceptEnv LANG LC_*
 
-# SFTP chroot — users in the sftp group are jailed to /srv/www
-# Ref: msp-portal-framework.md §7.3 (cert distribution via SFTP)
 Subsystem sftp internal-sftp
-Match Group sftp
-    ChrootDirectory /srv/www
-    ForceCommand internal-sftp
-    AllowTcpForwarding no
-    X11Forwarding no
 EOL
-
-# Create sftp group — for dedicated cert-distribution accounts only, not the admin user
-groupadd sftp 2>/dev/null || true
 
 systemctl restart ssh
 
@@ -761,6 +922,13 @@ cat > /etc/aktechworks-net/config.json << 'EOL'
         "client_secret": "",
         "redirect_uri": "https://aktechworks.net/auth/callback",
         "allowed_domains": ["aktechworks.com"]
+    },
+    "smtp2go": {
+        "api_key": ""
+    },
+    "huntress_sat": {
+        "client_id": "",
+        "client_secret": ""
     }
 }
 EOL
